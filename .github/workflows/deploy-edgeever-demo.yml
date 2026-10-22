@@ -33,8 +33,9 @@ concurrency:
 env:
   UPSTREAM_REPOSITORY: tianma-if/edgeever
   UPDATE_CHANNEL: ${{ inputs.channel || 'stable' }}
+  FORCE_REDEPLOY: ${{ github.event_name == 'workflow_dispatch' && inputs.force || false }}
+  MARKER_FILE: .edgeever-deployed.json
   DEPLOY_DIR: .edgeever-deploy
-  WORKER_NAME: edgeever
   EDGE_EVER_WORKER_NAME: edgeever
   EDGE_EVER_WORKERS_DEV: "true"
   EDGE_EVER_D1_DATABASE_NAME: edgeever
@@ -56,12 +57,6 @@ jobs:
     name: Sync upstream and deploy
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    outputs:
-      target_ref: ${{ steps.upstream.outputs.target_ref }}
-      target_commit: ${{ steps.upstream.outputs.target_commit }}
-      target_version: ${{ steps.upstream.outputs.target_version }}
-      decision: ${{ steps.upstream.outputs.decision }}
-      deployed: ${{ steps.deploy.outcome }}
     steps:
       - name: Checkout Fork
         uses: actions/checkout@v5
@@ -80,6 +75,7 @@ jobs:
           case "${UPDATE_CHANNEL}" in
             stable)
               target_ref="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest" --jq '.tag_name')"
+              git fetch upstream "refs/tags/${target_ref}:refs/tags/${target_ref}" --depth 1 2>/dev/null || true
               ;;
             edge)
               target_ref="upstream/main"
@@ -90,18 +86,20 @@ jobs:
               ;;
           esac
 
-          # Fetch the exact commit the target ref points at.
-          git fetch upstream "refs/tags/${target_ref}:refs/tags/${target_ref}" --depth 1 2>/dev/null || true
           target_commit="$(git rev-parse "${target_ref}^{commit}")"
           target_version="$(git show "${target_commit}:package.json" \
             | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version","unknown"))')"
 
-          current_version="$(python3 -c 'import json; print(json.load(open("package.json")).get("version","unknown"))')"
-          current_commit="$(git rev-parse HEAD)"
+          deployed_commit=""
+          deployed_version=""
+          if [ -f "${MARKER_FILE}" ]; then
+            deployed_commit="$(python3 -c "import json;print(json.load(open('${MARKER_FILE}')).get('target_commit',''))" 2>/dev/null || true)"
+            deployed_version="$(python3 -c "import json;print(json.load(open('${MARKER_FILE}')).get('version',''))" 2>/dev/null || true)"
+          fi
 
-          if [ "${FORCE:-false}" = "true" ]; then
+          if [ "${FORCE_REDEPLOY}" = "true" ]; then
             decision="forced"
-          elif [ "${current_version}" = "${target_version}" ] && [ "${current_commit}" = "${target_commit}" ]; then
+          elif [ "${deployed_commit}" = "${target_commit}" ]; then
             decision="already_aligned"
           else
             decision="update"
@@ -110,8 +108,8 @@ jobs:
           echo "target_ref=${target_ref}" >> "${GITHUB_OUTPUT}"
           echo "target_commit=${target_commit}" >> "${GITHUB_OUTPUT}"
           echo "target_version=${target_version}" >> "${GITHUB_OUTPUT}"
-          echo "current_version=${current_version}" >> "${GITHUB_OUTPUT}"
           echo "decision=${decision}" >> "${GITHUB_OUTPUT}"
+          echo "should_deploy=$([ "${decision}" = "already_aligned" ] && echo false || echo true)" >> "${GITHUB_OUTPUT}"
 
           {
             echo "### EdgeEver deploy / 部署"
@@ -119,30 +117,32 @@ jobs:
             echo "| Field / 字段 | Value / 值 |"
             echo "| --- | --- |"
             echo "| Channel / 通道 | \`${UPDATE_CHANNEL}\` |"
-            echo "| Upstream target / 上游目标 | \`${target_ref}\` (v${target_version}) |"
-            echo "| Fork main / 当前 | \`${current_commit:0:12}\` (v${current_version}) |"
+            echo "| Upstream target / 上游目标 | \`${target_ref}\` (v${target_version}, \`${target_commit:0:12}\`) |"
+            echo "| Last deployed / 上次部署 | \`${deployed_commit:0:12}\` (v${deployed_version:-none}) |"
             echo "| Decision / 判定 | \`${decision}\` |"
           } >> "${GITHUB_STEP_SUMMARY}"
 
+          echo "target=${target_ref}@${target_commit:0:12} deployed=${deployed_commit:0:12} decision=${decision}"
+
       - name: Prepare workspace
+        if: steps.upstream.outputs.should_deploy == 'true'
         shell: bash
-        run: |
-          set -euo pipefail
-          # Build in a separate directory so this Fork's main does not need to be
-          # rewritten by the updater (Cloudflare Workers Builds is not used here).
-          git worktree add --force "${DEPLOY_DIR}" "${{ steps.upstream.outputs.target_commit }}"
+        run: git worktree add --force "${DEPLOY_DIR}" "${{ steps.upstream.outputs.target_commit }}"
 
       - name: Set up Bun
+        if: steps.upstream.outputs.should_deploy == 'true'
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.14
 
       - name: Set up Node
+        if: steps.upstream.outputs.should_deploy == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "22"
 
       - name: Install dependencies
+        if: steps.upstream.outputs.should_deploy == 'true'
         working-directory: ${{ env.DEPLOY_DIR }}
         shell: bash
         run: |
@@ -158,25 +158,25 @@ jobs:
           exit 1
 
       - name: Build web and worker
+        if: steps.upstream.outputs.should_deploy == 'true'
         working-directory: ${{ env.DEPLOY_DIR }}
         shell: bash
         run: |
           set -euo pipefail
-          # Worker entry (esbuild) and the SPA assets it serves.
           bun run build:web
           bun run build:worker
 
       - name: Apply D1 migrations
+        if: steps.upstream.outputs.should_deploy == 'true'
         working-directory: ${{ env.DEPLOY_DIR }}
         shell: bash
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-          bun run db:migrate:remote
+        run: bun run db:migrate:remote
 
       - name: Deploy Worker
+        if: steps.upstream.outputs.should_deploy == 'true'
         id: deploy
         working-directory: ${{ env.DEPLOY_DIR }}
         shell: bash
@@ -186,26 +186,27 @@ jobs:
           EDGE_EVER_AUTH_PASSWORD: ${{ secrets.EDGE_EVER_AUTH_PASSWORD }}
         run: |
           set -euo pipefail
-          cat > .env.local <<EOF
-          EDGE_EVER_WORKER_NAME=${EDGE_EVER_WORKER_NAME}
-          EDGE_EVER_WORKERS_DEV=${EDGE_EVER_WORKERS_DEV}
-          EDGE_EVER_D1_DATABASE_NAME=${EDGE_EVER_D1_DATABASE_NAME}
-          EDGE_EVER_D1_DATABASE_ID=${EDGE_EVER_D1_DATABASE_ID}
-          EDGE_EVER_R2_BUCKET_NAME=${EDGE_EVER_R2_BUCKET_NAME}
-          EDGE_EVER_CUSTOM_DOMAIN=${EDGE_EVER_CUSTOM_DOMAIN}
-          EDGE_EVER_AUTH_USERNAME=${EDGE_EVER_AUTH_USERNAME}
-          EDGE_EVER_AUTH_PASSWORD=${EDGE_EVER_AUTH_PASSWORD}
-          EDGE_EVER_SESSION_TTL_DAYS=${EDGE_EVER_SESSION_TTL_DAYS}
-          EDGE_EVER_AUTH_LOGIN_WINDOW_SECONDS=${EDGE_EVER_AUTH_LOGIN_WINDOW_SECONDS}
-          EDGE_EVER_AUTH_LOGIN_USERNAME_MAX_ATTEMPTS=${EDGE_EVER_AUTH_LOGIN_USERNAME_MAX_ATTEMPTS}
-          EDGE_EVER_AUTH_LOGIN_USERNAME_COOLDOWN_SECONDS=${EDGE_EVER_AUTH_LOGIN_USERNAME_COOLDOWN_SECONDS}
-          EDGE_EVER_AUTH_LOGIN_IP_MAX_ATTEMPTS=${EDGE_EVER_AUTH_LOGIN_IP_MAX_ATTEMPTS}
-          EDGE_EVER_AUTH_LOGIN_IP_COOLDOWN_SECONDS=${EDGE_EVER_AUTH_LOGIN_IP_COOLDOWN_SECONDS}
-          EDGE_EVER_DEMO_MODE=${EDGE_EVER_DEMO_MODE}
-          EOF
+          {
+            echo "EDGE_EVER_WORKER_NAME=${EDGE_EVER_WORKER_NAME}"
+            echo "EDGE_EVER_WORKERS_DEV=${EDGE_EVER_WORKERS_DEV}"
+            echo "EDGE_EVER_D1_DATABASE_NAME=${EDGE_EVER_D1_DATABASE_NAME}"
+            echo "EDGE_EVER_D1_DATABASE_ID=${EDGE_EVER_D1_DATABASE_ID}"
+            echo "EDGE_EVER_R2_BUCKET_NAME=${EDGE_EVER_R2_BUCKET_NAME}"
+            echo "EDGE_EVER_CUSTOM_DOMAIN=${EDGE_EVER_CUSTOM_DOMAIN}"
+            echo "EDGE_EVER_AUTH_USERNAME=${EDGE_EVER_AUTH_USERNAME}"
+            echo "EDGE_EVER_AUTH_PASSWORD=${EDGE_EVER_AUTH_PASSWORD}"
+            echo "EDGE_EVER_SESSION_TTL_DAYS=${EDGE_EVER_SESSION_TTL_DAYS}"
+            echo "EDGE_EVER_AUTH_LOGIN_WINDOW_SECONDS=${EDGE_EVER_AUTH_LOGIN_WINDOW_SECONDS}"
+            echo "EDGE_EVER_AUTH_LOGIN_USERNAME_MAX_ATTEMPTS=${EDGE_EVER_AUTH_LOGIN_USERNAME_MAX_ATTEMPTS}"
+            echo "EDGE_EVER_AUTH_LOGIN_USERNAME_COOLDOWN_SECONDS=${EDGE_EVER_AUTH_LOGIN_USERNAME_COOLDOWN_SECONDS}"
+            echo "EDGE_EVER_AUTH_LOGIN_IP_MAX_ATTEMPTS=${EDGE_EVER_AUTH_LOGIN_IP_MAX_ATTEMPTS}"
+            echo "EDGE_EVER_AUTH_LOGIN_IP_COOLDOWN_SECONDS=${EDGE_EVER_AUTH_LOGIN_IP_COOLDOWN_SECONDS}"
+            echo "EDGE_EVER_DEMO_MODE=${EDGE_EVER_DEMO_MODE}"
+          } > .env.local
           bun run deploy:worker
 
       - name: Verify deployment
+        if: steps.upstream.outputs.should_deploy == 'true'
         shell: bash
         env:
           HEALTH_URL: ${{ env.EDGE_EVER_DEPLOYMENT_URL }}/api/health
@@ -215,7 +216,6 @@ jobs:
             body="$(curl -fsS --max-time 15 "${HEALTH_URL}" || true)"
             if echo "${body}" | grep -q '"ok":true'; then
               echo "Health OK on attempt ${attempt}: ${body}"
-              echo "health=${body}" >> "${GITHUB_OUTPUT}"
               {
                 echo ""
                 echo "**Health check passed / 健康检查通过**"
@@ -231,7 +231,63 @@ jobs:
           echo "Health check never returned ok:true" >&2
           exit 1
 
+      - name: Record deployed target
+        if: steps.upstream.outputs.should_deploy == 'true'
+        shell: bash
+        env:
+          TARGET_REF: ${{ steps.upstream.outputs.target_ref }}
+          TARGET_COMMIT: ${{ steps.upstream.outputs.target_commit }}
+          TARGET_VERSION: ${{ steps.upstream.outputs.target_version }}
+        run: |
+          set -euo pipefail
+          python3 - "${MARKER_FILE}" <<'PY'
+          import json, os, sys
+          path = sys.argv[1]
+          with open(path, "w", encoding="utf-8") as handle:
+              json.dump(
+                  {
+                      "channel": os.environ["UPDATE_CHANNEL"],
+                      "target_ref": os.environ["TARGET_REF"],
+                      "target_commit": os.environ["TARGET_COMMIT"],
+                      "version": os.environ["TARGET_VERSION"],
+                  },
+                  handle,
+                  indent=2,
+              )
+              handle.write("\n")
+          PY
+          git config user.name "edgeever-updater[bot]"
+          git config user.email "edgeever-updater[bot]@users.noreply.github.com"
+          git add "${MARKER_FILE}"
+          if git diff --cached --quiet; then
+            echo "Marker unchanged."
+            exit 0
+          fi
+          git commit -m "chore: record deployed EdgeEver ${TARGET_REF} [skip ci]"
+          git push origin HEAD:main
+
       - name: Clean up worktree
         if: always()
         shell: bash
         run: git worktree remove --force "${DEPLOY_DIR}" || true
+
+      - name: Report result
+        if: always() && steps.upstream.outcome == 'success'
+        env:
+          DECISION: ${{ steps.upstream.outputs.decision }}
+          TARGET_REF: ${{ steps.upstream.outputs.target_ref }}
+          TARGET_VERSION: ${{ steps.upstream.outputs.target_version }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+        run: |
+          {
+            echo ""
+            echo "### Result / 结果"
+            echo ""
+            if [ "${DECISION}" = "already_aligned" ]; then
+              echo "Already deployed \`${TARGET_REF}\` (v${TARGET_VERSION}). No deployment requested."
+            elif [ "${DEPLOY_OUTCOME}" = "success" ]; then
+              echo "Deployed \`${TARGET_REF}\` (v${TARGET_VERSION}) to https://demo.xaaxa.com"
+            else
+              echo "Deployment of \`${TARGET_REF}\` did not complete (deploy=\`${DEPLOY_OUTCOME:-skipped}\`). The live site was left unchanged."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
