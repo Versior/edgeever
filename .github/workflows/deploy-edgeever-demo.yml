@@ -57,6 +57,10 @@ jobs:
     name: Sync upstream and deploy
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    env:
+      # `gh` needs an explicit token inside Actions; without it the run dies
+      # with "set the GH_TOKEN environment variable" (exit code 4).
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout Fork
         uses: actions/checkout@v5
@@ -70,15 +74,21 @@ jobs:
         run: |
           set -euo pipefail
           git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
-          git fetch upstream main --tags --depth 1
 
+          # Fetch only the ref we need, shallow. Never rely on tag name resolution:
+          # a shallow clone reports "reference is not a tree" for annotated tags.
           case "${UPDATE_CHANNEL}" in
             stable)
               target_ref="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest" --jq '.tag_name')"
-              git fetch upstream "refs/tags/${target_ref}:refs/tags/${target_ref}" --depth 1 2>/dev/null || true
+              if [ -z "${target_ref}" ]; then
+                echo "Could not resolve the latest stable Release tag." >&2
+                exit 1
+              fi
+              git fetch upstream "refs/tags/${target_ref}" --depth 1 --no-tags
               ;;
             edge)
               target_ref="upstream/main"
+              git fetch upstream main --depth 1 --no-tags
               ;;
             *)
               echo "Unsupported channel: ${UPDATE_CHANNEL}" >&2
@@ -86,7 +96,7 @@ jobs:
               ;;
           esac
 
-          target_commit="$(git rev-parse "${target_ref}^{commit}")"
+          target_commit="$(git rev-parse "FETCH_HEAD^{commit}")"
           target_version="$(git show "${target_commit}:package.json" \
             | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version","unknown"))')"
 
