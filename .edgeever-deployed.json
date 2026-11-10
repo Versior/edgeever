@@ -1,6 +1,6 @@
 {
-  "channel": "edge",
-  "target_ref": "upstream/main",
-  "target_commit": "34cc72f48d751b88af5dab49be6a2db99e20bd26",
-  "version": "2.24.0"
+  "channel": "stable",
+  "target_ref": "v2.25.0",
+  "target_commit": "ef4cda655f381a629d42b69c8e79c3f168c82c5c",
+  "version": "2.25.0"
 }
