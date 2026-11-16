@@ -1,6 +1,6 @@
 {
   "channel": "stable",
-  "target_ref": "v2.27.0",
-  "target_commit": "8926c20842a7c1fb8c7b4834d13c245dcb541c87",
-  "version": "2.27.0"
+  "target_ref": "v2.28.0",
+  "target_commit": "d5f8ac06441104d90acd3daf2f1a5f31286e3619",
+  "version": "2.28.0"
 }
